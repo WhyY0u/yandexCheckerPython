@@ -1,0 +1,19 @@
+[project]
+name = "yandexcheckerpython"
+version = "0.1.0"
+description = "Yandex phone number checker bot with captcha solving"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "easyocr>=1.7.2",
+    "numpy>=2.4.2",
+    "opencv-python-headless>=4.13.0.92",
+    "pytesseract>=0.3.13",
+    "requests>=2.32.5",
+    "selenium>=4.41.0",
+    "telebot>=0.0.5",
+    "pyinstaller>=6.11.1",
+]
+
+[project.scripts]
+build = "build:main"
