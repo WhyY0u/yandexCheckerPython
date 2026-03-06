@@ -1,4 +1,4 @@
 @echo off
 cd /d %~dp0
-uv run main.py
+uv run bot.py
 pause

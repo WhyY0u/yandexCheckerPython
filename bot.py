@@ -14,6 +14,10 @@ import sys
 import os
 import pytesseract
 from datetime import datetime, timedelta
+import warnings
+
+# Игнорировать предупреждения PyTorch о pin_memory
+warnings.filterwarnings("ignore", message=".*pin_memory.*")
 
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
