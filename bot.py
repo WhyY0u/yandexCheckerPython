@@ -13,11 +13,12 @@ import subprocess
 import sys
 import os
 import pytesseract
+from datetime import datetime, timedelta
 
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-BOT_TOKEN = "8666414527:AAH1cJqhQEYaTh5H6qT2LSNcmd-RhYFoQXI"
+BOT_TOKEN = "8666414527:AAE_2LciXEdXo0rGbZSw25xco-3b-1E5XnQ"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 
@@ -25,6 +26,21 @@ _phone_queue = defaultdict(list)
 _check_active = defaultdict(bool)
 
 _tesseract_path = None
+
+# Статистика и доверенные лица
+_stats_file = "stats.json"
+_stats = {
+    "users": set(),
+    "total_requests": 0,
+    "daily_requests": 0,
+    "last_reset_date": datetime.now().strftime("%Y-%m-%d")
+}
+_trusted_users = set()
+
+# ID администратора из переменной окружения (опционально)
+_admin_id = os.environ.get("BOT_ADMIN_ID")
+if _admin_id:
+    _trusted_users.add(_admin_id)
 
 
 def setup_tesseract_path():
@@ -493,6 +509,72 @@ def clear_skip_flag(chat_id):
     if chat_id in _skip_captcha_flag:
         del _skip_captcha_flag[chat_id]
 
+
+def load_stats():
+    """Загрузка статистики и доверенных пользователей из файла"""
+    global _stats, _trusted_users
+    try:
+        if os.path.exists(_stats_file):
+            with open(_stats_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                _stats["users"] = set(data.get("users", []))
+                _stats["total_requests"] = data.get("total_requests", 0)
+                _stats["daily_requests"] = data.get("daily_requests", 0)
+                _stats["last_reset_date"] = data.get("last_reset_date", datetime.now().strftime("%Y-%m-%d"))
+                _trusted_users = set(data.get("trusted_users", []))
+            print(f"📊 Статистика загружена: {_stats['total_requests']} всего запросов, {len(_stats['users'])} пользователей")
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить статистику: {e}")
+
+
+def save_stats():
+    """Сохранение статистики и доверенных пользователей в файл"""
+    global _stats, _trusted_users
+    try:
+        data = {
+            "users": list(_stats["users"]),
+            "total_requests": _stats["total_requests"],
+            "daily_requests": _stats["daily_requests"],
+            "last_reset_date": _stats["last_reset_date"],
+            "trusted_users": list(_trusted_users)
+        }
+        with open(_stats_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить статистику: {e}")
+
+
+def reset_daily_stats_if_needed():
+    """Сброс дневной статистики если наступил новый день"""
+    global _stats
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _stats["last_reset_date"] != today:
+        _stats["daily_requests"] = 0
+        _stats["last_reset_date"] = today
+        print("📊 Дневная статистика сброшена")
+
+
+def add_user_request(chat_id):
+    """Добавление пользователя и подсчёт запроса"""
+    global _stats
+    reset_daily_stats_if_needed()
+    _stats["users"].add(str(chat_id))
+    _stats["total_requests"] += 1
+    _stats["daily_requests"] += 1
+    save_stats()
+
+
+def is_trusted_user(chat_id):
+    """Проверка, является ли пользователь доверенным"""
+    return str(chat_id) in _trusted_users
+
+
+def add_trusted_user(chat_id):
+    """Добавление пользователя в список доверенных"""
+    global _trusted_users
+    _trusted_users.add(str(chat_id))
+    save_stats()
+
 def solve_captcha_loop(csrf_token, session, track_id, phone, chat_id=None):
     """
     Цикл решения капч до получения hasAvailableAccounts или команды /skip
@@ -562,6 +644,10 @@ def check_phone(phone, chat_id=None, formatted_output=False):
     Основная функция проверки номера
     """
     print(f"\n🔍 Начинаем проверку номера: {phone}")
+    
+    # Подсчёт запроса
+    if chat_id:
+        add_user_request(chat_id)
 
     # Получаем CSRF
     csrf_token, session = get_csrf_token()
@@ -672,6 +758,65 @@ def send_welcome(message):
     bot.reply_to(message, "👋 Привет! Отправь мне номер телефона для проверки.\n\nФормат: 89212810954 или +79212810954\n\nМожно отправлять несколько номеров:\n- По одному в сообщении\n- Несколько сразу (каждый с новой строки)\n\nИспользуй /skip для пропуска текущей проверки")
 
 
+@bot.message_handler(commands=['id'])
+def get_chat_id(message):
+    chat_id = message.chat.id
+    bot.reply_to(message, f"🆔 Ваш chat_id: {chat_id}")
+
+
+def escape_markdown_v2(text):
+    """Экранирование специальных символов для MarkdownV2"""
+    special_chars = r'_*[]()~`>#+-=|{}.!'
+    for char in special_chars:
+        text = text.replace(char, f'\\{char}')
+    return text
+
+
+@bot.message_handler(commands=['add'])
+def add_trusted(message):
+    chat_id = message.chat.id
+    
+    if not is_trusted_user(str(chat_id)):
+        bot.reply_to(message, "❌ Доступ запрещён")
+        return
+    
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "❌ Использование: /add <chat_id>\n\nПример: /add 123456789")
+        return
+    
+    try:
+        new_trusted_id = args[1]
+        add_trusted_user(new_trusted_id)
+        bot.reply_to(message, f"✅ Пользователь {escape_markdown_v2(str(new_trusted_id))} добавлен в список доверенных лиц", parse_mode="MarkdownV2")
+    except ValueError:
+        bot.reply_to(message, "❌ Неверный формат chat_id")
+
+
+@bot.message_handler(commands=['stats'])
+def show_stats(message):
+    chat_id = message.chat.id
+    
+    if not is_trusted_user(str(chat_id)):
+        bot.reply_to(message, "❌ Доступ запрещён.\n\nИспользуйте команду /id для получения вашего chat_id")
+        return
+    
+    reset_daily_stats_if_needed()
+    
+    users_count = len(_stats["users"])
+    total_requests = _stats["total_requests"]
+    daily_requests = _stats["daily_requests"]
+    
+    stats_text = (
+        f"📊 *Статистика бота*\n\n"
+        f"👥 Пользователей (написали хотя бы 1 сообщение): {users_count}\n"
+        f"📈 Всего запросов: {total_requests}\n"
+        f"📅 Запросов за сегодня: {daily_requests}"
+    )
+    
+    bot.reply_to(message, stats_text, parse_mode="Markdown")
+
+
 @bot.message_handler(commands=['skip'])
 def skip_captcha(message):
     chat_id = message.chat.id
@@ -733,9 +878,12 @@ if __name__ == "__main__":
         except EOFError:
             pass
         sys.exit(1)
-    
+
     # Настраиваем путь для pytesseract
     setup_tesseract_path()
-    
+
+    # Загружаем статистику и доверенных пользователей
+    load_stats()
+
     print("\n🤖 Бот запущен...")
     bot.infinity_polling()
