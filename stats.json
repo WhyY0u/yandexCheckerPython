@@ -1,14 +1,14 @@
 {
   "users": [
-    "8286452428",
-    "5664645239"
+    "5664645239",
+    "8286452428"
   ],
-  "total_requests": 6,
-  "daily_requests": 6,
-  "last_reset_date": "2026-03-06",
+  "total_requests": 162,
+  "daily_requests": 156,
+  "last_reset_date": "2026-03-12",
   "trusted_users": [
-    "8286452428",
     "1332470740",
-    "5664645239"
+    "5664645239",
+    "8286452428"
   ]
 }

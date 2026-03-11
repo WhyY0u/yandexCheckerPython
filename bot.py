@@ -1,5 +1,6 @@
 import telebot
 import requests
+from requests.adapters import HTTPAdapter, Retry
 import re
 import uuid
 import json
@@ -15,6 +16,9 @@ import os
 import pytesseract
 from datetime import datetime, timedelta
 import warnings
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 
 # Игнорировать предупреждения PyTorch о pin_memory
 warnings.filterwarnings("ignore", message=".*pin_memory.*")
@@ -24,7 +28,18 @@ if sys.platform == 'win32':
 
 BOT_TOKEN = "8666414527:AAE_2LciXEdXo0rGbZSw25xco-3b-1E5XnQ"
 
-bot = telebot.TeleBot(BOT_TOKEN)
+# Ограничение одновременных проверок (оптимально для 100 пользователей)
+MAX_CONCURRENT_CHECKS = 50
+_check_semaphore = threading.Semaphore(MAX_CONCURRENT_CHECKS)
+
+# Пул потоков для обработки запросов
+_executor = ThreadPoolExecutor(max_workers=60)
+
+# Прогресс обработки для каждого чата
+_check_progress = defaultdict(lambda: {"total": 0, "processed": 0, "results": []})
+_progress_lock = threading.Lock()
+
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
 
 _phone_queue = defaultdict(list)
 _check_active = defaultdict(bool)
@@ -45,6 +60,41 @@ _trusted_users = set()
 _admin_id = os.environ.get("BOT_ADMIN_ID")
 if _admin_id:
     _trusted_users.add(_admin_id)
+
+# Пул сессий для кеширования HTTP соединений
+_session_pool = threading.local()
+
+# Глобальный EasyOCR reader (кешируется, не создаётся каждый раз)
+_easyocr_reader = None
+_easyocr_lock = threading.Lock()
+
+
+def get_session():
+    """Получение сессии из пула с настройками retry и таймаутами"""
+    if not hasattr(_session_pool, 'session') or _session_pool.session is None:
+        session = requests.Session()
+        retry = Retry(
+            total=2,
+            backoff_factor=0.3,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["HEAD", "GET", "POST"]
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=20)
+        session.mount('http://', adapter)
+        session.mount('https://', adapter)
+        _session_pool.session = session
+    return _session_pool.session
+
+
+def get_easyocr_reader():
+    """Получение закешированного EasyOCR reader"""
+    global _easyocr_reader
+    with _easyocr_lock:
+        if _easyocr_reader is None:
+            print("🔄 Инициализация EasyOCR reader (первый запуск)...")
+            _easyocr_reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+            print("✅ EasyOCR reader инициализирован")
+        return _easyocr_reader
 
 
 def setup_tesseract_path():
@@ -158,20 +208,21 @@ def solve_captcha_easyocr(image_url):
     """
     try:
         print(f"🔄 Распознавание капчи по URL: {image_url[:50]}...")
-        
-        img_response = requests.get(image_url, stream=True)
+
+        session = get_session()
+        img_response = session.get(image_url, timeout=10)
         if img_response.status_code != 200:
             print(f"❌ Не удалось скачать изображение: {img_response.status_code}")
             return None
 
         img = Image.open(io.BytesIO(img_response.content))
 
-        reader = easyocr.Reader(['en'], gpu=True, verbose=False)
+        reader = get_easyocr_reader()
         img_array = np.array(img)
 
         results = reader.readtext(img_array)
         print(f"📊 EasyOCR результатов: {len(results)}")
-        
+
         sorted_results = sorted(results, key=lambda x: x[0][0][0])
 
         texts = [res[1].lower() for res in sorted_results]
@@ -196,7 +247,7 @@ def get_csrf_token():
     """
     Получение CSRF-токена из страницы авторизации
     """
-    session = requests.Session()
+    session = get_session()
 
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -205,7 +256,7 @@ def get_csrf_token():
     }
 
     try:
-        response = session.get('https://passport.yandex.ru/auth/', headers=headers)
+        response = session.get('https://passport.yandex.ru/auth/', headers=headers, timeout=10)
     except Exception as e:
         print(f"❌ Ошибка запроса: {e}")
         return None, None
@@ -255,7 +306,7 @@ def get_csrf_with_fresh_headers(session):
         'Sec-Fetch-User': '?1',
     }
 
-    response = session.get('https://passport.yandex.ru/auth/', headers=fresh_headers)
+    response = session.get('https://passport.yandex.ru/auth/', headers=fresh_headers, timeout=10)
 
     if response.status_code == 200:
         match = re.search(r'window\.__CSRF__\s*=\s*"([^"]+)"', response.text)
@@ -308,7 +359,7 @@ def create_track(csrf_token, session):
     }
 
     try:
-        response = session.post(url, headers=headers, json=data)
+        response = session.post(url, headers=headers, json=data, timeout=15)
         print(f"📡 Create track: {response.status_code}")
 
         if response.status_code == 200:
@@ -365,7 +416,7 @@ def generate_captcha(csrf_token, session, track_id):
     }
 
     try:
-        response = session.post(url, headers=headers, json=data)
+        response = session.post(url, headers=headers, json=data, timeout=15)
 
         if response.status_code == 200:
             captcha_data = response.json()
@@ -414,13 +465,13 @@ def submit_captcha_and_recheck(csrf_token, session, track_id, phone_number, capt
     
     try:
         print(f"📡 Отправка captcha_check...")
-        check_response = session.post(captcha_check_url, headers=captcha_headers, json=captcha_data)
+        check_response = session.post(captcha_check_url, headers=captcha_headers, json=captcha_data, timeout=15)
         print(f"📡 Captcha check status: {check_response.status_code}")
-        
+
         if check_response.status_code == 200:
             captcha_result = check_response.json()
             print(f"📊 Captcha result: {captcha_result}")
-            
+
             if not captcha_result.get('correct', False):
                 print("❌ Капча неверная!")
                 return None
@@ -479,7 +530,7 @@ def check_availability(csrf_token, session, track_id, phone_number):
     }
 
     try:
-        response = session.post(url, headers=headers, json=data)
+        response = session.post(url, headers=headers, json=data, timeout=15)
         print(f"📡 Check availability: {response.status_code}")
 
         if response.status_code == 200:
@@ -638,6 +689,7 @@ def solve_captcha_loop(csrf_token, session, track_id, phone, chat_id=None):
 
         if result.get('antifraudScore') == 'captcha':
             print("⚠️ Снова требуется капча")
+            time.sleep(1)  # Небольшая задержка перед следующей капчей
             continue
 
         return result
@@ -648,67 +700,76 @@ def check_phone(phone, chat_id=None, formatted_output=False):
     Основная функция проверки номера
     """
     print(f"\n🔍 Начинаем проверку номера: {phone}")
-    
+
     # Подсчёт запроса
     if chat_id:
         add_user_request(chat_id)
 
-    # Получаем CSRF
-    csrf_token, session = get_csrf_token()
-    if not csrf_token:
-        print("❌ Не удалось получить CSRF, пробуем свежие заголовки...")
-        csrf_token = get_csrf_with_fresh_headers(session)
-
-    if not csrf_token:
-        print("❌ CSRF не получен")
+    # Ограничение одновременных проверок
+    acquired = _check_semaphore.acquire(timeout=120)
+    if not acquired:
+        print("⚠️ Превышено время ожидания в очереди")
         return None
 
-    print(f"✅ CSRF получен: {csrf_token[:30]}...")
+    try:
+        # Получаем CSRF
+        csrf_token, session = get_csrf_token()
+        if not csrf_token:
+            print("❌ Не удалось получить CSRF, пробуем свежие заголовки...")
+            csrf_token = get_csrf_with_fresh_headers(session)
 
-    # Создаём трек
-    track_id = create_track(csrf_token, session)
-    if not track_id:
-        print("❌ Не удалось создать трек")
-        return None
+        if not csrf_token:
+            print("❌ CSRF не получен")
+            return None
 
-    # Проверяем доступность
-    result = check_availability(csrf_token, session, track_id, phone)
+        print(f"✅ CSRF получен: {csrf_token[:30]}...")
 
-    if result:
-        print(f"📊 antifraudScore: {result.get('antifraudScore')}")
+        # Создаём трек
+        track_id = create_track(csrf_token, session)
+        if not track_id:
+            print("❌ Не удалось создать трек")
+            return None
 
-        if result.get('antifraudScore') == 'captcha':
-            print("⚠️ Требуется капча, запускаем цикл решения...")
-            while True:
-                # Проверяем флаг пропуска перед запуском цикла
-                if chat_id and get_skip_flag(chat_id):
-                    print("⚠️ Получена команда /skip до начала цикла")
-                    clear_skip_flag(chat_id)
-                    return None
+        # Проверяем доступность
+        result = check_availability(csrf_token, session, track_id, phone)
 
-                final_result = solve_captcha_loop(csrf_token, session, track_id, phone, chat_id)
+        if result:
+            print(f"📊 antifraudScore: {result.get('antifraudScore')}")
 
-                if final_result:
-                    has_available = final_result.get('hasAvailableAccounts', False)
-                    print(f"✅ Результат: hasAvailableAccounts={has_available}")
-                    return "registered" if has_available else "not_registered"
-                else:
-                    # Если solve_captcha_loop вернул None - проверяем, была ли команда /skip
+            if result.get('antifraudScore') == 'captcha':
+                print("⚠️ Требуется капча, запускаем цикл решения...")
+                while True:
+                    # Проверяем флаг пропуска перед запуском цикла
                     if chat_id and get_skip_flag(chat_id):
+                        print("⚠️ Получена команда /skip до начала цикла")
                         clear_skip_flag(chat_id)
                         return None
-                    # Иначе повторяем цикл (будет новая генерация капчи)
-                    print("⚠️ solve_captcha_loop вернул None, повторяем цикл...")
-                    time.sleep(2)
-        else:
-            # Если нет капчи, проверяем напрямую
-            has_available = result.get('hasAvailableAccounts', False)
-            print(f"✅ Результат без капчи: hasAvailableAccounts={has_available}")
-            return "registered" if has_available else "not_registered"
-    else:
-        print("❌ check_availability вернул None")
 
-    return None
+                    final_result = solve_captcha_loop(csrf_token, session, track_id, phone, chat_id)
+
+                    if final_result:
+                        has_available = final_result.get('hasAvailableAccounts', False)
+                        print(f"✅ Результат: hasAvailableAccounts={has_available}")
+                        return "registered" if has_available else "not_registered"
+                    else:
+                        # Если solve_captcha_loop вернул None - проверяем, была ли команда /skip
+                        if chat_id and get_skip_flag(chat_id):
+                            clear_skip_flag(chat_id)
+                            return None
+                        # Иначе повторяем цикл (будет новая генерация капчи)
+                        print("⚠️ solve_captcha_loop вернул None, повторяем цикл...")
+                        time.sleep(2)
+            else:
+                # Если нет капчи, проверяем напрямую
+                has_available = result.get('hasAvailableAccounts', False)
+                print(f"✅ Результат без капчи: hasAvailableAccounts={has_available}")
+                return "registered" if has_available else "not_registered"
+        else:
+            print("❌ check_availability вернул None")
+
+        return None
+    finally:
+        _check_semaphore.release()
 
 
 def process_phone_result(phone, result, chat_id):
@@ -718,20 +779,16 @@ def process_phone_result(phone, result, chat_id):
     elif result == "not_registered":
         response = f"❌ Аккаунт не зарегистрирован"
     elif result is None:
-        response = f"⚠️ Проверка пропущена по команде /skip"
+        response = f"⚠️ Проверка пропущена по команде /skip или ошибка"
     else:
         response = f"❌ Не удалось проверить номер"
-    
-    # Если нужен формат с номером
-    if len(_phone_queue[chat_id]) > 0 or _check_active[chat_id]:
-        response = f"{phone}: {response}"
-    
+
     return response
 
 
 def process_queue(chat_id):
-    """Обработка очереди номеров для чата"""
-    global _check_active
+    """Обработка очереди номеров для чата - все номера параллельно, один итоговый файл"""
+    global _check_active, _check_progress
     
     # Если уже идёт проверка - выходим
     if _check_active[chat_id]:
@@ -739,27 +796,143 @@ def process_queue(chat_id):
     
     _check_active[chat_id] = True
     
-    try:
-        while _phone_queue[chat_id]:
-            # Проверяем флаг пропуска
-            if get_skip_flag(chat_id):
-                clear_skip_flag(chat_id)
-                bot.send_message(chat_id, "⚠️ Проверка остановлена командой /skip")
-                break
+    # Копируем очередь и очищаем её
+    phones_to_check = list(_phone_queue[chat_id])
+    _phone_queue[chat_id] = []
+    
+    total = len(phones_to_check)
+    
+    # Инициализируем прогресс
+    with _progress_lock:
+        _check_progress[chat_id] = {
+            "total": total,
+            "processed": 0,
+            "results": [],
+            "errors": [],
+            "started": time.time()
+        }
+    
+    # Отправляем уведомление о начале
+    if total > 10:
+        bot.send_message(chat_id, f"🔄 Начата проверка {total} номеров...\n\n⏳ Ожидаемое время: ~{max(30, total // 2)} сек.\n\nИспользуйте /status для просмотра прогресса")
+    
+    results = []
+    
+    def check_single_phone(phone):
+        """Проверка одного номера с обновлением прогресса"""
+        result = check_phone(phone, chat_id=None)  # Не считаем запросы повторно
+        
+        if result == "registered":
+            status = "✅"
+            detail = "зарегистрирован"
+        elif result == "not_registered":
+            status = "❌"
+            detail = "не зарегистрирован"
+        else:
+            status = "⚠️"
+            detail = "ошибка проверки"
+        
+        with _progress_lock:
+            _check_progress[chat_id]["processed"] += 1
+            result_entry = f"{status} {phone}"
+            _check_progress[chat_id]["results"].append(result_entry)
             
-            phone = _phone_queue[chat_id].pop(0)
-            
-            # Проверяем номер
-            result = check_phone(phone, chat_id=chat_id)
-            response = process_phone_result(phone, result, chat_id)
-            bot.send_message(chat_id, response)
-    finally:
-        _check_active[chat_id] = False
+            # Сохраняем детали ошибок
+            if result is None:
+                _check_progress[chat_id]["errors"].append(f"{phone} — ошибка проверки (таймаут/капча/сеть)")
+        
+        return (phone, result)
+    
+    # Запускаем все номера параллельно
+    futures = []
+    for phone in phones_to_check:
+        future = _executor.submit(check_single_phone, phone)
+        futures.append(future)
+    
+    # Ждём завершения всех проверок
+    for future in futures:
+        try:
+            future.result(timeout=180)
+        except Exception as e:
+            print(f"❌ Ошибка при проверке: {e}")
+    
+    # Собираем результаты
+    with _progress_lock:
+        results = _check_progress[chat_id]["results"].copy()
+        errors_list = _check_progress[chat_id]["errors"].copy()
+        elapsed = time.time() - _check_progress[chat_id]["started"]
+        del _check_progress[chat_id]
+    
+    # Формируем итоговый отчёт
+    registered = sum(1 for r in results if r.startswith("✅"))
+    not_registered = sum(1 for r in results if r.startswith("❌"))
+    errors = sum(1 for r in results if r.startswith("⚠️"))
+    
+    # Создаём итоговое сообщение
+    summary = (
+        f"📊 **Итоги проверки**\n\n"
+        f"⏱ Время: {elapsed:.1f} сек.\n"
+        f"📱 Всего номеров: {total}\n"
+        f"✅ Зарегистрировано: {registered}\n"
+        f"❌ Не зарегистрировано: {not_registered}\n"
+        f"⚠️ Ошибок: {errors}\n\n"
+    )
+    
+    # Добавляем детали ошибок если есть
+    if errors > 0:
+        summary += f"🔴 **Номера с ошибками ({len(errors_list)}):**\n"
+        for err in errors_list[:10]:  # Показываем первые 10
+            summary += f"  • {err}\n"
+        if len(errors_list) > 10:
+            summary += f"  ... и ещё {len(errors_list) - 10}\n"
+        summary += "\n"
+    
+    # Если номеров много - сохраняем в файл
+    if total >= 20:
+        # Создаём временный файл с результатами
+        filename = f"result_{chat_id}_{int(time.time())}.txt"
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(summary.replace("**", ""))
+            f.write("\n" + "="*50 + "\n\n")
+            for result in results:
+                f.write(result + "\n")
+        
+        # Отправляем файл
+        try:
+            with open(filename, 'rb') as f:
+                bot.send_document(chat_id, f, caption=summary, parse_mode="Markdown")
+            os.remove(filename)
+        except Exception as e:
+            print(f"❌ Ошибка отправки файла: {e}")
+            # Фолбэк - отправляем текстом
+            bot.send_message(chat_id, summary + "\n".join(results[:50]) + ("\n... и ещё" if len(results) > 50 else ""))
+    else:
+        # Отправляем текстом
+        full_report = summary + "\n".join(results)
+        bot.send_message(chat_id, full_report, parse_mode="Markdown")
+    
+    _check_active[chat_id] = False
 
 
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    bot.reply_to(message, "👋 Привет! Отправь мне номер телефона для проверки.\n\nФормат: 89212810954 или +79212810954\n\nМожно отправлять несколько номеров:\n- По одному в сообщении\n- Несколько сразу (каждый с новой строки)\n\nИспользуй /skip для пропуска текущей проверки")
+    bot.reply_to(message, 
+        "👋 Привет! Отправь мне номер телефона для проверки.\n\n"
+        "📋 **Команды:**\n"
+        "/start - Это сообщение\n"
+        "/status - Прогресс текущей проверки\n"
+        "/skip - Пропустить капчу\n"
+        "/id - Узнать chat_id\n"
+        "/stats - Статистика бота (для админов)\n\n"
+        "📱 **Формат номера:**\n"
+        "89212810954 или +79212810954\n\n"
+        "📬 **Можно отправлять:**\n"
+        "- По одному в сообщении\n"
+        "- До 100 номеров сразу (каждый с новой строки)\n\n"
+        "⚡ **При большой нагрузке:**\n"
+        "- 100 номеров обрабатываются за 1-2 минуты\n"
+        "- Результат приходит одним файлом\n"
+        "- Используйте /status для прогресса")
 
 
 @bot.message_handler(commands=['id'])
@@ -828,49 +1001,95 @@ def skip_captcha(message):
     bot.reply_to(message, "⚠️ Команда /skip принята. Пропускаю текущую капчу...")
 
 
+@bot.message_handler(commands=['status'])
+def show_status(message):
+    chat_id = message.chat.id
+    
+    with _progress_lock:
+        if chat_id not in _check_progress:
+            bot.reply_to(message, "ℹ️ Нет активных проверок в этом чате")
+            return
+        
+        progress = _check_progress[chat_id]
+        total = progress["total"]
+        processed = progress["processed"]
+        percent = (processed / total * 100) if total > 0 else 0
+        elapsed = time.time() - progress.get("started", time.time())
+        
+        # Оценка оставшегося времени
+        if processed > 0 and elapsed > 0:
+            avg_per_number = elapsed / processed
+            remaining = (total - processed) * avg_per_number
+            eta = f"~{remaining:.0f} сек."
+        else:
+            eta = "вычисление..."
+        
+        status_text = (
+            f"📊 **Прогресс проверки**\n\n"
+            f"📱 Всего номеров: {total}\n"
+            f"✅ Обработано: {processed}/{total}\n"
+            f"📈 Прогресс: {percent:.1f}%\n"
+            f"⏱ Прошло времени: {elapsed:.1f} сек.\n"
+            f"⏳ Осталось: {eta}\n\n"
+            f"🔄 Пожалуйста, дождитесь завершения..."
+        )
+        
+        bot.reply_to(message, status_text, parse_mode="Markdown")
+
+
 @bot.message_handler(func=lambda message: True)
 def handle_message(message):
     chat_id = message.chat.id
     text = message.text.strip()
-    
+
     # Разбиваем сообщение на строки (поддержка нескольких номеров)
     lines = text.split('\n')
-    
+
     # Извлекаем и форматируем номера
     valid_phones = []
     for line in lines:
         line = line.strip()
         if not line:
             continue
-        
+
         formatted_phone = format_phone_number(line)
         if formatted_phone:
             valid_phones.append(formatted_phone)
-    
+
     # Если нет валидных номеров
     if not valid_phones:
         bot.reply_to(message, "❌ Неверный формат номера.\n\nОтправь номер в формате:\n89212810954 или +79212810954\n\nМожно отправлять несколько номеров сразу (каждый с новой строки)")
         return
-    
-    # Если номер один и нет активной проверки - отвечаем сразу
-    if len(valid_phones) == 1 and not _check_active[chat_id] and not _phone_queue[chat_id]:
+
+    # Подсчёт запросов для статистики
+    if chat_id:
+        for _ in valid_phones:
+            add_user_request(chat_id)
+
+    # Добавляем номера в очередь
+    _phone_queue[chat_id].extend(valid_phones)
+
+    if len(valid_phones) == 1 and not _check_active[chat_id]:
+        # Один номер - быстрая проверка
         phone = valid_phones[0]
         bot.reply_to(message, f"🔍 Проверяю номер {phone}...")
         
-        result = check_phone(phone, chat_id=chat_id)
-        response = process_phone_result(phone, result, chat_id)
-        bot.send_message(chat_id, response)
+        future = _executor.submit(check_phone, phone, chat_id=None)
+        try:
+            result = future.result(timeout=180)
+        except Exception as e:
+            print(f"❌ Ошибка при проверке {phone}: {e}")
+            result = None
+        
+        status = "✅" if result == "registered" else ("❌" if result == "not_registered" else "⚠️")
+        bot.send_message(chat_id, f"{phone}: {status}")
     else:
-        # Добавляем номера в очередь
-        _phone_queue[chat_id].extend(valid_phones)
-        
-        if len(valid_phones) == 1:
-            bot.reply_to(message, f"🔍 Номер {valid_phones[0]} добавлен в очередь")
-        else:
-            bot.reply_to(message, f"🔍 Добавлено номеров: {len(valid_phones)}\nНачинаю проверку...")
-        
-        # Запускаем обработку очереди
-        process_queue(chat_id)
+        # Несколько номеров или активная проверка - в очередь
+        total_queued = len(_phone_queue[chat_id])
+        bot.reply_to(message, f"🔍 Добавлено номеров: {len(valid_phones)}\n📋 В очереди: {total_queued}\n\nНачинаю проверку...")
+
+        # Запускаем обработку очереди в пуле потоков
+        _executor.submit(process_queue, chat_id)
 
 
 if __name__ == "__main__":
@@ -889,5 +1108,15 @@ if __name__ == "__main__":
     # Загружаем статистику и доверенных пользователей
     load_stats()
 
-    print("\n🤖 Бот запущен...")
-    bot.infinity_polling()
+    # Предварительная инициализация EasyOCR
+    print("\n🔄 Предварительная инициализация EasyOCR...")
+    get_easyocr_reader()
+
+    print("\n🤖 Бот запущен (многопоточный режим, макс. одновременных проверок: {})...".format(MAX_CONCURRENT_CHECKS))
+    try:
+        bot.infinity_polling(skip_pending=True, timeout=60)
+    except KeyboardInterrupt:
+        print("\n🛑 Остановка бота...")
+    finally:
+        print("🔄 Завершение пула потоков...")
+        _executor.shutdown(wait=False)
