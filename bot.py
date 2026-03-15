@@ -20,7 +20,6 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
-# Игнорировать предупреждения PyTorch о pin_memory
 warnings.filterwarnings("ignore", message=".*pin_memory.*")
 
 if sys.platform == 'win32':
@@ -28,19 +27,14 @@ if sys.platform == 'win32':
 
 BOT_TOKEN = "8666414527:AAE_2LciXEdXo0rGbZSw25xco-3b-1E5XnQ"
 
-# Ограничение одновременных проверок (оптимально для GPU EasyOCR)
-# 10-15 потоков лучше чем 100 - GPU не захлёбывается
 MAX_CONCURRENT_CHECKS = 15
 _check_semaphore = threading.Semaphore(MAX_CONCURRENT_CHECKS)
 
-# Пул потоков для обработки запросов
 _executor = ThreadPoolExecutor(max_workers=20)
 
-# Прогресс обработки для каждого чата
 _check_progress = defaultdict(lambda: {"total": 0, "processed": 0, "results": []})
 _progress_lock = threading.Lock()
 
-# Кеш сессий CSRF + track (на 10 номеров)
 _session_cache = {
     "csrf": None,
     "track": None,
@@ -48,12 +42,15 @@ _session_cache = {
     "created": 0,
     "used": 0,
     "max_uses": 10,
-    "ttl": 300  # 5 минут
+    "ttl": 300  
 }
 _cache_lock = threading.Lock()
 
-# Задержка между стартами проверок (чтобы не душить Яндекс)
-_request_delay = 0.2  # 200ms между стартами
+_phone_result_cache = {}  
+_phone_result_cache_lock = threading.Lock()
+_PHONE_CACHE_TTL = 3600 
+
+_request_delay = 0.2
 
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
 
@@ -62,7 +59,6 @@ _check_active = defaultdict(bool)
 
 _tesseract_path = None
 
-# Статистика и доверенные лица
 _stats_file = "stats.json"
 _stats = {
     "users": set(),
@@ -72,15 +68,12 @@ _stats = {
 }
 _trusted_users = set()
 
-# ID администратора из переменной окружения (опционально)
 _admin_id = os.environ.get("BOT_ADMIN_ID")
 if _admin_id:
     _trusted_users.add(_admin_id)
 
-# Пул сессий для кеширования HTTP соединений
 _session_pool = threading.local()
 
-# Глобальный EasyOCR reader (кешируется, не создаётся каждый раз)
 _easyocr_reader = None
 _easyocr_lock = threading.Lock()
 
@@ -832,6 +825,13 @@ def check_phone(phone, chat_id=None, formatted_output=False):
     if chat_id:
         add_user_request(chat_id)
 
+    # Проверяем кеш результатов
+    with _phone_result_cache_lock:
+        cached = _phone_result_cache.get(phone)
+        if cached and time.time() - cached["time"] < _PHONE_CACHE_TTL:
+            print(f"📦 Кеш результата: {phone} -> {cached['result']}")
+            return cached["result"]
+
     # Ограничение одновременных проверок
     acquired = _check_semaphore.acquire(timeout=120)
     if not acquired:
@@ -839,21 +839,18 @@ def check_phone(phone, chat_id=None, formatted_output=False):
         return None
 
     try:
-        # Получаем кешированную сессию CSRF+track
-        csrf_token, track_id, session = get_cached_csrf_track()
-
-        if not csrf_token or not track_id:
-            print("❌ Не удалось получить CSRF+track из кеша, пробуем напрямую...")
+        # Создаём новую сессию CSRF+track для каждого номера
+        session = get_session()
+        csrf_token = get_csrf_token_with_session(session)
+        if not csrf_token:
             csrf_token, session = get_csrf_token()
-            if not csrf_token:
-                csrf_token = get_csrf_with_fresh_headers(session)
-            if not csrf_token:
-                print("❌ CSRF не получен")
-                return None
-            track_id = create_track(csrf_token, session)
-            if not track_id:
-                print("❌ Не удалось создать трек")
-                return None
+        if not csrf_token:
+            print("❌ CSRF не получен")
+            return None
+        track_id = create_track(csrf_token, session)
+        if not track_id:
+            print("❌ Не удалось создать трек")
+            return None
 
         print(f"✅ Используем трек: {track_id}")
 
@@ -877,7 +874,10 @@ def check_phone(phone, chat_id=None, formatted_output=False):
                     if final_result:
                         has_available = final_result.get('hasAvailableAccounts', False)
                         print(f"✅ Результат: hasAvailableAccounts={has_available}")
-                        return "registered" if has_available else "not_registered"
+                        res = "registered" if has_available else "not_registered"
+                        with _phone_result_cache_lock:
+                            _phone_result_cache[phone] = {"result": res, "time": time.time()}
+                        return res
                     else:
                         # Если solve_captcha_loop вернул None - проверяем, была ли команда /skip
                         if chat_id and get_skip_flag(chat_id):
@@ -890,7 +890,10 @@ def check_phone(phone, chat_id=None, formatted_output=False):
                 # Если нет капчи, проверяем напрямую
                 has_available = result.get('hasAvailableAccounts', False)
                 print(f"✅ Результат без капчи: hasAvailableAccounts={has_available}")
-                return "registered" if has_available else "not_registered"
+                res = "registered" if has_available else "not_registered"
+                with _phone_result_cache_lock:
+                    _phone_result_cache[phone] = {"result": res, "time": time.time()}
+                return res
         else:
             print("❌ check_availability вернул None")
 
@@ -926,9 +929,24 @@ def process_queue(chat_id):
     # Копируем очередь и очищаем её
     phones_to_check = list(_phone_queue[chat_id])
     _phone_queue[chat_id] = []
-    
+
+    # Находим и удаляем дубликаты
+    seen = []
+    duplicates = []
+    for phone in phones_to_check:
+        if phone in seen:
+            if phone not in duplicates:
+                duplicates.append(phone)
+        else:
+            seen.append(phone)
+    phones_to_check = seen
+
+    if duplicates:
+        dup_text = "\n".join(f"  • {p}" for p in duplicates)
+        bot.send_message(chat_id, f"⚠️ Найдены дубликаты ({len(duplicates)} шт.) — исключены из проверки:\n{dup_text}")
+
     total = len(phones_to_check)
-    
+
     # Инициализируем прогресс
     with _progress_lock:
         _check_progress[chat_id] = {
@@ -938,7 +956,7 @@ def process_queue(chat_id):
             "errors": [],
             "started": time.time()
         }
-    
+
     # Отправляем уведомление о начале
     if total > 10:
         bot.send_message(chat_id, f"🔄 Начата проверка {total} номеров...\n\n⏳ Ожидаемое время: ~{max(30, total // 2)} сек.\n\nИспользуйте /status для просмотра прогресса")

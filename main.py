@@ -11,9 +11,6 @@ import io
 
 
 def solve_captcha_easyocr(image_url):
-    """
-    Распознавание текстовой капчи через EasyOCR
-    """
     try:
         img_response = requests.get(image_url, stream=True)
         if img_response.status_code != 200:
@@ -46,9 +43,7 @@ def solve_captcha_easyocr(image_url):
         return None
 
 def get_csrf_token():
-    """
-    Получение CSRF-токена из страницы авторизации
-    """
+
     session = requests.Session()
 
     headers = {
@@ -84,9 +79,7 @@ def get_csrf_token():
     return None, session
 
 def get_csrf_with_fresh_headers(session):
-    """
-    Пробуем с обновлёнными заголовками
-    """
+
     fresh_headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36 Edg/145.0.0.0',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
