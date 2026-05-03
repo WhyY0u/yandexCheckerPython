@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(Get-ChildItem \"C:\\\\Users\\\\aimsi\\\\.claude\\\\projects\\\\d--yandexcheck\\\\memory\" -Force)",
+      "Bash(Get-ChildItem \"d:\\\\yandexcheck\" -Recurse)",
+      "Bash(Select-Object FullName)",
+      "Bash(python -c \"import checker; import server; print\\('✅ Все модули загружены успешно!'\\)\")",
+      "Bash(git init *)",
+      "Bash(git config *)",
+      "Bash(git add *)"
+    ]
+  }
+}
