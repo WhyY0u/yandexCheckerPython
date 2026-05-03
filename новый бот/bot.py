@@ -25,7 +25,16 @@ warnings.filterwarnings("ignore", message=".*pin_memory.*")
 if sys.platform == 'win32':
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
-BOT_TOKEN = "8608706570:AAF0zc0EyvCZx-lyUf8v4VaDiCREZZW-0oo"
+# Загружаем BOT_TOKEN из переменной окружения
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("❌ BOT_TOKEN не установлен! Создайте .env файл с BOT_TOKEN=your_token")
 
 MAX_CONCURRENT_CHECKS = 15
 _check_semaphore = threading.Semaphore(MAX_CONCURRENT_CHECKS)
