@@ -54,7 +54,9 @@ result_*.txt
 *.log
 .env
 .env.local
+.env.*.local
 bot_token.txt
+BOT_TOKEN
 
 # Tesseract (not needed in repo)
 tesseract-ocr/

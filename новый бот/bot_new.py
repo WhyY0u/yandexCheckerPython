@@ -23,7 +23,29 @@ if sys.platform == 'win32':
 # Импортируем модуль с логикой проверки
 import checker
 
-BOT_TOKEN = "8608706570:AAF0zc0EyvCZx-lyUf8v4VaDiCREZZW-0oo"
+# Загружаем переменные окружения из .env файла
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    print("⚠️ python-dotenv не установлен, используем переменные окружения напрямую")
+
+# Получаем BOT_TOKEN из переменной окружения
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    print("\n" + "="*60)
+    print("❌ ОШИБКА: BOT_TOKEN не установлен!")
+    print("="*60)
+    print("\n1. Создайте файл '.env' в папке 'новый бот':")
+    print("   BOT_TOKEN=your_bot_token_here")
+    print("\n2. Получите токен от @BotFather в Telegram")
+    print("\n3. Установите python-dotenv:")
+    print("   pip install python-dotenv")
+    print("\nИли установите переменную окружения:")
+    print("   export BOT_TOKEN=your_token")
+    print("="*60 + "\n")
+    sys.exit(1)
 
 # Инициализируем бота
 bot = telebot.TeleBot(BOT_TOKEN, threaded=True)

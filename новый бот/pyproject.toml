@@ -13,6 +13,9 @@ dependencies = [
     "selenium>=4.41.0",
     "telebot>=0.0.5",
     "pyinstaller>=6.11.1",
+    "fastapi>=0.136.1",
+    "python-multipart>=0.0.27",
+    "uvicorn>=0.46.0",
 ]
 
 [project.scripts]
